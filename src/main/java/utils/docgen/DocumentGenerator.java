@@ -410,6 +410,12 @@ public class DocumentGenerator extends KVGenerator{
 
     public Tuple2<String, Object> nextUpdate() {
         long temp = this.ws.dr.updateItr.getAndIncrement();
+        // Guard: another thread may have passed has_next_update()'s fast-path
+        // check while we were also passing it, causing both to claim the same
+        // last slot. If temp is past the end, return null so nextUpdateBatch()
+        // can retry via has_next_update() which will perform the CircularKey
+        // reset under its synchronized block.
+        if (temp >= this.ws.dr.update_e) return null;
         String k = null;
         Object v = null;
             try {
@@ -427,6 +433,7 @@ public class DocumentGenerator extends KVGenerator{
 
     public Tuple2<String, Object> nextExpiry() {
         long temp = this.ws.dr.expiryItr.getAndIncrement();
+        if (temp >= this.ws.dr.expiry_e) return null; // TOCTOU guard (mirrors nextUpdate)
         String k = null;
         Object v = null;
             try {
@@ -511,7 +518,9 @@ public class DocumentGenerator extends KVGenerator{
         List<Tuple2<String, Object>> docs = new ArrayList<Tuple2<String,Object>>();
         int count = 0;
         while (this.has_next_update() && count<ws.batchSize*ws.updates/100) {
-            docs.add(this.nextUpdate());
+            Tuple2<String, Object> doc = this.nextUpdate();
+            if (doc == null) continue; // TOCTOU: another thread claimed the last slot; retry
+            docs.add(doc);
             count += 1;
         }
         return docs;
@@ -521,7 +530,9 @@ public class DocumentGenerator extends KVGenerator{
         List<Tuple2<String, Object>> docs = new ArrayList<Tuple2<String,Object>>();
         int count = 0;
         while (this.has_next_expiry() && count<ws.batchSize*ws.expiry/100) {
-            docs.add(this.nextExpiry());
+            Tuple2<String, Object> doc = this.nextExpiry();
+            if (doc == null) continue; // TOCTOU guard (mirrors nextUpdateBatch)
+            docs.add(doc);
             count += 1;
         }
         return docs;
