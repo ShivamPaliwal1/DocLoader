@@ -2,7 +2,6 @@ package couchbase.sdk;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.log4j.LogManager;
@@ -14,9 +13,6 @@ public class SDKClientPool {
     
     // Thread-safe client collection cache
     private ConcurrentHashMap<String, ClientInfo> clientCache = new ConcurrentHashMap<>();
-    
-    // Block up to this long waiting for an idle client before giving up
-    private static final int CLIENT_WAIT_TIMEOUT_MINUTES = 30;
 
     // Thread-safe client pools by bucket
     private ConcurrentHashMap<String, LinkedBlockingQueue<SDKClient>> idleClients = new ConcurrentHashMap<>();
@@ -105,15 +101,12 @@ public class SDKClientPool {
             return null;
         }
 
-        // Block until a client becomes available or timeout expires.
-        // With 200-300 threads sharing a finite pool, spinning with a fixed retry cap
-        // causes spurious failures on long-running loads — blocking here is cheaper and correct.
-        SDKClient client = idlePool.poll(CLIENT_WAIT_TIMEOUT_MINUTES, TimeUnit.MINUTES);
-        if (client == null) {
-            logger.error("Timed out waiting " + CLIENT_WAIT_TIMEOUT_MINUTES
-                    + " min for idle SDK client for bucket " + bucket_name);
-            return null;
-        }
+        // Block until a client becomes available.
+        // With many threads sharing a finite pool, spinning with a fixed retry cap
+        // causes spurious failures on long-running loads — blocking indefinitely here
+        // is cheaper and correct. A task holds no client while waiting, so clients are
+        // only ever held by actively-progressing tasks that will eventually release them.
+        SDKClient client = idlePool.take();
 
         // Configure client for this collection
         client.selectCollection(scope, collection);
