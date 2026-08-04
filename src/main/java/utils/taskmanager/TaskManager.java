@@ -64,6 +64,17 @@ public class TaskManager {
         return task.result;
     }
 
+    // Non-blocking progress read: does not touch the Future, so it is safe to
+    // call while another thread is blocked inside getTaskResult()'s future.get().
+    public long getTaskProgress(Task task) {
+        return task.completedOps.get();
+    }
+
+    public boolean isTaskRunning(Task task) {
+        Future future = this.tasks.get(task.taskName);
+        return future != null && !future.isDone();
+    }
+
     public void abortTask(Task task) {
         Future future = this.tasks.get(task.taskName);
         if (future != null) {

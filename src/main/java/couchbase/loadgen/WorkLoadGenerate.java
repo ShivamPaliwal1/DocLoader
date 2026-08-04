@@ -259,6 +259,7 @@ public class WorkLoadGenerate extends Task{
                     if(this.sdk != null)
                         result = docops.bulkInsert(this.sdk.connection, docs, setOptions);
                     ops += dg.ws.batchSize*dg.ws.creates/100;
+                    this.completedOps.addAndGet(docs.size());
                     if(this.trackFailures && result.size()>0){
                         this.result = false;
                         try {
@@ -280,6 +281,7 @@ public class WorkLoadGenerate extends Task{
                     if(this.sdk != null)
                         result = docops.bulkUpsert(this.sdk.connection, docs, upsertOptions);
                     ops += dg.ws.batchSize*dg.ws.updates/100;
+                    this.completedOps.addAndGet(docs.size());
                     if(this.trackFailures && result.size()>0){
                         this.result = false;
                         try {
@@ -298,6 +300,7 @@ public class WorkLoadGenerate extends Task{
                     if(this.sdk != null)
                         result = docops.bulkInsert(this.sdk.connection, docs, expiryOptions);
                     ops += dg.ws.batchSize*dg.ws.expiry/100;
+                    this.completedOps.addAndGet(docs.size());
                     if(this.trackFailures && result.size()>0){
                         this.result = false;
                         try {
@@ -319,6 +322,7 @@ public class WorkLoadGenerate extends Task{
                         this.esClient.deleteDocs(this.collection.replace("_", ""), docs);
                     }
                     ops += dg.ws.batchSize*dg.ws.deletes/100;
+                    this.completedOps.addAndGet(docs.size());
                     if(this.trackFailures && result.size()>0){
                         this.result = false;
                         try {
@@ -364,6 +368,7 @@ public class WorkLoadGenerate extends Task{
                         }
                     }
                     ops += dg.ws.batchSize*dg.ws.reads/100;
+                    this.completedOps.addAndGet(docs.size());
                 }
             }
             if(dg.ws.subdocs> 0) {
@@ -374,6 +379,7 @@ public class WorkLoadGenerate extends Task{
                     flag = true;
                     List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(this.sdk.connection, docs, mutateInOptions);
                     ops += dg.ws.batchSize*dg.ws.subdocs/100;
+                    this.completedOps.addAndGet(docs.size());
                     this.update_subdoc_failed_mutation_result("insert", failedMutations, result);
                 }
 
@@ -382,6 +388,7 @@ public class WorkLoadGenerate extends Task{
                     flag = true;
                     List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(this.sdk.connection, docs, mutateInOptions);
                     ops += dg.ws.batchSize*dg.ws.subdocs/100;
+                    this.completedOps.addAndGet(docs.size());
                     this.update_subdoc_failed_mutation_result("upsert", failedMutations, result);
                 }
 
@@ -390,6 +397,7 @@ public class WorkLoadGenerate extends Task{
                     flag = true;
                     List<HashMap<String,Object>> result = subDocOps.bulkGetSubDocOperation(this.sdk.connection, lookup_docs, lookupInOptions);
                     ops += dg.ws.batchSize*dg.ws.subdocs/100;
+                    this.completedOps.addAndGet(lookup_docs.size());
                     this.update_subdoc_failed_mutation_result("lookup", failedMutations, result);
                 }
 
@@ -398,6 +406,7 @@ public class WorkLoadGenerate extends Task{
                     flag = true;
                     List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(this.sdk.connection, docs, mutateInOptions);
                     ops += dg.ws.batchSize*dg.ws.subdocs/100;
+                    this.completedOps.addAndGet(docs.size());
                     this.update_subdoc_failed_mutation_result("remove", failedMutations, result);
                 }
             }

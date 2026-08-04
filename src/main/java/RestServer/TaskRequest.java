@@ -604,6 +604,23 @@ public class TaskRequest {
         return new ResponseEntity<>(body, HttpStatus.OK);
     }
 
+    // Non-blocking: reports progress without waiting for the task to finish,
+    // so it is safe to poll while a get_task_result() call is stuck on another thread.
+    public ResponseEntity<Map<String, Object>> get_task_progress() {
+        Map<String, Object> body = new HashMap<>();
+        WorkLoadGenerate task = TaskRequest.loader_tasks.getOrDefault(this.taskName,
+                TaskRequest.completed_tasks.get(this.taskName));
+        if (task != null) {
+            body.put("completed_ops", TaskRequest.taskManager.getTaskProgress(task));
+            body.put("is_running", TaskRequest.taskManager.isTaskRunning(task));
+            body.put("status", true);
+        } else {
+            body.put("error", "Task " + this.taskName + " does not exists");
+            body.put("status", false);
+        }
+        return new ResponseEntity<>(body, HttpStatus.OK);
+    }
+
     public ResponseEntity<Map<String, Object>> stop_task() {
         Map<String, Object> body = new HashMap<>();
         WorkLoadGenerate task = TaskRequest.loader_tasks.get(this.taskName);
