@@ -224,7 +224,9 @@ public class WorkLoadGenerate extends Task{
                 .retryStrategy(this.dg.ws.retryStrategy);
         if (useClientDurability) mutateOpts = mutateOpts.durability(this.dg.ws.durability);
         mutateInOptions = mutateOpts;
-        lookupInOptions = LookupInOptions.lookupInOptions();
+        lookupInOptions = LookupInOptions.lookupInOptions()
+                .timeout(this.dg.ws.timeout)
+                .retryStrategy(this.dg.ws.retryStrategy);
 
         if(dg.ws.expiry == 0) {
             // If expiry load is not set and we have exp value set,
