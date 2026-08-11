@@ -34,8 +34,11 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
     private final String sparseSourcePath;
     private final String siftSourcePath;
 
-    // Sparse: offset index file for O(1) seeks (same approach as MSMARCOEmbeddingProduct)
-    private final long[] lineOffsets;
+    // Sparse: offset index file for O(1) seeks (same approach as MSMARCOEmbeddingProduct).
+    // Offsets are read one at a time via a positional read rather than slurped into a
+    // long[] — for an 8.8M-line source that array is ~70MB per generator instance.
+    private FileChannel idxChannel;
+    private long recordCount;
     private FileChannel sparseChannel;
     private BufferedReader sparseReader;
 
@@ -56,7 +59,9 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         this.siftSourcePath = resolveSiftSourcePath(ws);
 
         try {
-            this.lineOffsets = loadOrBuildIndex(sparseSourcePath);
+            String idxFilePath = ensureIndex(sparseSourcePath);
+            this.idxChannel = FileChannel.open(Paths.get(idxFilePath), StandardOpenOption.READ);
+            this.recordCount = idxChannel.size() / 8;
             this.sparseChannel = FileChannel.open(Paths.get(sparseSourcePath), StandardOpenOption.READ);
             this.siftChannel = FileChannel.open(Paths.get(siftSourcePath), StandardOpenOption.READ);
 
@@ -81,32 +86,17 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         }
     }
 
-    private static synchronized long[] loadOrBuildIndex(String vecFilePath) throws IOException {
+    // Ensures the .idx sidecar exists alongside the .vec file, building it if absent,
+    // and returns its path. Synchronized to prevent concurrent workers from racing to
+    // build the same index file.
+    private static synchronized String ensureIndex(String vecFilePath) throws IOException {
         String idxFilePath = vecFilePath + ".idx";
-        if (Files.exists(Paths.get(idxFilePath))) {
-            System.out.println("Loading offset index: " + idxFilePath);
-            return loadIndex(idxFilePath);
-        }
-        return buildAndSaveIndex(vecFilePath, idxFilePath);
+        if (!Files.exists(Paths.get(idxFilePath)))
+            buildAndSaveIndex(vecFilePath, idxFilePath);
+        return idxFilePath;
     }
 
-    private static long[] loadIndex(String idxFilePath) throws IOException {
-        try (FileChannel ch = FileChannel.open(Paths.get(idxFilePath), StandardOpenOption.READ)) {
-            int numRecords = (int) (ch.size() / 8);
-            long[] offsets = new long[numRecords];
-            ByteBuffer buf = ByteBuffer.allocate(8 * 8192).order(ByteOrder.LITTLE_ENDIAN);
-            int idx = 0;
-            while (ch.read(buf) > 0) {
-                buf.flip();
-                while (buf.remaining() >= 8)
-                    offsets[idx++] = buf.getLong();
-                buf.compact();
-            }
-            return offsets;
-        }
-    }
-
-    private static long[] buildAndSaveIndex(String vecFilePath, String idxFilePath) throws IOException {
+    private static void buildAndSaveIndex(String vecFilePath, String idxFilePath) throws IOException {
         System.out.println("Building offset index for: " + vecFilePath + " -> " + idxFilePath);
         ByteBuffer readBuf = ByteBuffer.allocateDirect(STREAM_BUFFER_SIZE);
         ByteBuffer writeBuf = ByteBuffer.allocate(8 * 8192).order(ByteOrder.LITTLE_ENDIAN);
@@ -140,12 +130,26 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         }
 
         System.out.println("Index built: " + idxFilePath);
-        return loadIndex(idxFilePath);
+    }
+
+    // Reads the byte offset of a single line from the .idx sidecar. Positional read,
+    // so it does not disturb idxChannel's own position and needs no synchronization.
+    private long offsetOf(long recordIndex) throws IOException {
+        if (recordIndex < 0 || recordIndex >= recordCount)
+            throw new IOException("record index " + recordIndex + " out of bounds [0, " + recordCount + ")");
+        ByteBuffer buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        long pos = recordIndex * 8L;
+        while (buf.hasRemaining()) {
+            if (idxChannel.read(buf, pos + buf.position()) < 0)
+                throw new IOException("truncated offset index at record " + recordIndex);
+        }
+        buf.flip();
+        return buf.getLong();
     }
 
     // Seeks both sparse and SIFT channels to the given record index in O(1).
     private void seekToRecord(long recordIndex) throws IOException {
-        sparseChannel.position(lineOffsets[(int) recordIndex]);
+        sparseChannel.position(offsetOf(recordIndex));
         sparseReader = new BufferedReader(
                 new InputStreamReader(Channels.newInputStream(sparseChannel), StandardCharsets.UTF_8),
                 STREAM_BUFFER_SIZE);
@@ -313,6 +317,10 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         if (siftChannel != null) {
             siftChannel.close();
             siftChannel = null;
+        }
+        if (idxChannel != null) {
+            idxChannel.close();
+            idxChannel = null;
         }
     }
 

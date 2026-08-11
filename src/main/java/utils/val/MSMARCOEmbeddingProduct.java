@@ -32,9 +32,12 @@ public class MSMARCOEmbeddingProduct implements Closeable {
     public WorkLoadSettings ws;
     private final String sourcePath;
 
-    // lineOffsets[i] = byte offset of line i in the .vec file
-    // Loaded from <vecFilePath>.idx on first use; built and saved if absent
-    private final long[] lineOffsets;
+    // <vecFilePath>.idx holds one little-endian long per line: the byte offset of
+    // that line in the .vec file. It is read one entry at a time via a positional
+    // read rather than slurped into a long[] — for an 8.8M-line source that array
+    // is ~70MB, and every generator instance would hold its own private copy.
+    private FileChannel idxChannel;
+    private long recordCount;
 
     private FileChannel fileChannel;
     private BufferedReader lineReader;
@@ -52,7 +55,9 @@ public class MSMARCOEmbeddingProduct implements Closeable {
         this.sourcePath = resolveSourcePath(ws);
 
         try {
-            this.lineOffsets = loadOrBuildIndex(sourcePath);
+            String idxFilePath = ensureIndex(sourcePath);
+            this.idxChannel = FileChannel.open(Paths.get(idxFilePath), StandardOpenOption.READ);
+            this.recordCount = idxChannel.size() / 8;
             this.fileChannel = FileChannel.open(Paths.get(sourcePath), StandardOpenOption.READ);
 
             if (ws.creates > 0 && ws.dr != null) {
@@ -76,36 +81,19 @@ public class MSMARCOEmbeddingProduct implements Closeable {
         }
     }
 
-    // Loads .idx if it exists alongside the .vec file, otherwise builds and saves it first.
-    // Synchronized to prevent concurrent workers from racing to build the same index file.
-    private static synchronized long[] loadOrBuildIndex(String vecFilePath) throws IOException {
+    // Ensures the .idx sidecar exists alongside the .vec file, building it if absent,
+    // and returns its path. Synchronized to prevent concurrent workers from racing to
+    // build the same index file.
+    private static synchronized String ensureIndex(String vecFilePath) throws IOException {
         String idxFilePath = vecFilePath + ".idx";
-        if (Files.exists(Paths.get(idxFilePath))) {
-            System.out.println("Loading offset index: " + idxFilePath);
-            return loadIndex(idxFilePath);
-        }
-        return buildAndSaveIndex(vecFilePath, idxFilePath);
+        if (!Files.exists(Paths.get(idxFilePath)))
+            buildAndSaveIndex(vecFilePath, idxFilePath);
+        return idxFilePath;
     }
 
-    private static long[] loadIndex(String idxFilePath) throws IOException {
-        try (FileChannel ch = FileChannel.open(Paths.get(idxFilePath), StandardOpenOption.READ)) {
-            int numRecords = (int) (ch.size() / 8);
-            long[] offsets = new long[numRecords];
-            ByteBuffer buf = ByteBuffer.allocate(8 * 8192).order(ByteOrder.LITTLE_ENDIAN);
-            int idx = 0;
-            while (ch.read(buf) > 0) {
-                buf.flip();
-                while (buf.remaining() >= 8)
-                    offsets[idx++] = buf.getLong();
-                buf.compact();
-            }
-            return offsets;
-        }
-    }
-
-    // Single pass: scans .vec for newlines, streams offsets directly to .idx, then loads it back.
-    // Never holds all offsets in memory during build — only the final long[] on load (~70MB).
-    private static long[] buildAndSaveIndex(String vecFilePath, String idxFilePath) throws IOException {
+    // Single pass: scans .vec for newlines, streams offsets directly to .idx.
+    // Never holds all offsets in memory.
+    private static void buildAndSaveIndex(String vecFilePath, String idxFilePath) throws IOException {
         System.out.println("Building offset index for: " + vecFilePath + " -> " + idxFilePath);
         ByteBuffer readBuf = ByteBuffer.allocateDirect(STREAM_BUFFER_SIZE);
         ByteBuffer writeBuf = ByteBuffer.allocate(8 * 8192).order(ByteOrder.LITTLE_ENDIAN);
@@ -140,13 +128,27 @@ public class MSMARCOEmbeddingProduct implements Closeable {
         }
 
         System.out.println("Index built: " + idxFilePath);
-        return loadIndex(idxFilePath);
+    }
+
+    // Reads the byte offset of a single line from the .idx sidecar. Positional read,
+    // so it does not disturb idxChannel's own position and needs no synchronization.
+    private long offsetOf(long recordIndex) throws IOException {
+        if (recordIndex < 0 || recordIndex >= recordCount)
+            throw new IOException("record index " + recordIndex + " out of bounds [0, " + recordCount + ")");
+        ByteBuffer buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        long pos = recordIndex * 8L;
+        while (buf.hasRemaining()) {
+            if (idxChannel.read(buf, pos + buf.position()) < 0)
+                throw new IOException("truncated offset index at record " + recordIndex);
+        }
+        buf.flip();
+        return buf.getLong();
     }
 
     // O(1) seek to any record by direct byte offset lookup.
     // Do NOT close lineReader — closing Channels.newInputStream would close fileChannel.
     private void seekToRecord(long recordIndex) throws IOException {
-        fileChannel.position(lineOffsets[(int) recordIndex]);
+        fileChannel.position(offsetOf(recordIndex));
         lineReader = new BufferedReader(
                 new InputStreamReader(Channels.newInputStream(fileChannel), StandardCharsets.UTF_8),
                 STREAM_BUFFER_SIZE);
@@ -293,6 +295,10 @@ public class MSMARCOEmbeddingProduct implements Closeable {
         if (fileChannel != null) {
             fileChannel.close();
             fileChannel = null;
+        }
+        if (idxChannel != null) {
+            idxChannel.close();
+            idxChannel = null;
         }
     }
 
