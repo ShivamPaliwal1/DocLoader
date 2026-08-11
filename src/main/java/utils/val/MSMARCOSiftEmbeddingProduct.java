@@ -12,9 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.Base64;
-import java.util.List;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -212,43 +210,130 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         if (line == null) {
             throw new IOException("No more sparse embedding records available from source: " + sparseSourcePath);
         }
-        line = line.trim();
-        while (line.isEmpty()) {
+        while (isWhitespaceOnly(line)) {
             line = sparseReader.readLine();
             if (line == null) {
                 throw new IOException("No more sparse embedding records available from source: " + sparseSourcePath);
             }
-            line = line.trim();
         }
+        return parseRecord(line);
+    }
 
-        String[] parts = line.split("\t");
-        if (parts.length != 3) {
-            throw new IOException("Invalid .vec format: expected 3 tab-separated parts, got " + parts.length);
-        }
+    // Parses one "<id>\t[indices]\t[values]" record into { int[], float[] }.
+    //
+    // The pair is kept as primitive arrays rather than List<Integer>/List<Float>: at
+    // ~300 non-zeros the boxed form costs ~12KB per document against ~2.5KB here, and
+    // every in-flight batch retains batchSize x workers of them.
+    //
+    // Returned as Object[] so Jackson still emits [[indices...],[values...]], byte for
+    // byte what the nested-List form produced.
+    private static Object parseRecord(String line) throws IOException {
+        int firstTab = line.indexOf('\t');
+        int secondTab = firstTab < 0 ? -1 : line.indexOf('\t', firstTab + 1);
+        if (secondTab < 0)
+            throw new IOException("Invalid .vec format: expected 3 tab-separated parts");
 
-        String indicesStr = parts[1].trim();
-        indicesStr = indicesStr.substring(1, indicesStr.length() - 1);
-        String[] indexParts = indicesStr.split(",");
+        int indicesOpen = line.indexOf('[', firstTab + 1);
+        int indicesClose = line.lastIndexOf(']', secondTab);
+        int valuesOpen = line.indexOf('[', secondTab + 1);
+        int valuesClose = line.lastIndexOf(']');
+        if (indicesOpen < 0 || indicesClose < indicesOpen || valuesOpen < 0 || valuesClose < valuesOpen)
+            throw new IOException("Invalid .vec format: malformed index/value list");
 
-        String valuesStr = parts[2].trim();
-        valuesStr = valuesStr.substring(1, valuesStr.length() - 1);
-        String[] valueParts = valuesStr.split(",");
-        if (valueParts.length != indexParts.length) {
+        int count = countElements(line, indicesOpen + 1, indicesClose);
+        int[] indices = new int[count];
+        float[] values = new float[count];
+        int indexCount = parseIndices(line, indicesOpen + 1, indicesClose, indices);
+        int valueCount = parseValues(line, valuesOpen + 1, valuesClose, values);
+        if (indexCount != valueCount) {
             throw new IOException("Indices and values arrays have different lengths: "
-                    + indexParts.length + " vs " + valueParts.length);
+                    + indexCount + " vs " + valueCount);
         }
+        return new Object[] { indices, values };
+    }
 
-        List<Integer> indicesList = new ArrayList<>(indexParts.length);
-        List<Float> valuesList = new ArrayList<>(indexParts.length);
-        for (int i = 0; i < indexParts.length; i++) {
-            indicesList.add(Integer.parseInt(indexParts[i].trim()));
-            valuesList.add(Float.parseFloat(valueParts[i].trim()));
+    // Counts comma-separated elements in [from, to); 0 if the region is whitespace only.
+    private static int countElements(String s, int from, int to) {
+        int i = from;
+        while (i < to && s.charAt(i) <= ' ')
+            i++;
+        if (i >= to)
+            return 0;
+        int count = 1;
+        for (; i < to; i++)
+            if (s.charAt(i) == ',')
+                count++;
+        return count;
+    }
+
+    // Parses the comma-separated integers in [from, to) into out. Allocation free.
+    private static int parseIndices(String s, int from, int to, int[] out) throws IOException {
+        int n = 0;
+        int i = from;
+        while (i < to) {
+            while (i < to && isSeparator(s.charAt(i)))
+                i++;
+            if (i >= to)
+                break;
+            boolean negative = s.charAt(i) == '-';
+            if (negative || s.charAt(i) == '+')
+                i++;
+            int start = i;
+            int value = 0;
+            while (i < to) {
+                char c = s.charAt(i);
+                if (c < '0' || c > '9')
+                    break;
+                value = value * 10 + (c - '0');
+                i++;
+            }
+            if (i == start)
+                throw new IOException("Invalid .vec format: malformed index at offset " + start);
+            if (n == out.length)
+                throw new IOException("Invalid .vec format: more indices than counted");
+            out[n++] = negative ? -value : value;
         }
+        return n;
+    }
 
-        List<Object> result = new ArrayList<>(2);
-        result.add(indicesList);
-        result.add(valuesList);
-        return result;
+    // Parses the comma-separated floats in [from, to) into out.
+    //
+    // Float.parseFloat is kept, on a per-token substring, rather than accumulating the
+    // decimal by hand: the source prints up to 17 significant digits, past the 2^53
+    // mantissa limit under which a hand-rolled accumulator is still provably correctly
+    // rounded. parseFloat is what guarantees the emitted JSON is unchanged.
+    private static int parseValues(String s, int from, int to, float[] out) throws IOException {
+        int n = 0;
+        int i = from;
+        while (i < to) {
+            while (i < to && isSeparator(s.charAt(i)))
+                i++;
+            if (i >= to)
+                break;
+            int start = i;
+            while (i < to && s.charAt(i) != ',')
+                i++;
+            int end = i;
+            while (end > start && s.charAt(end - 1) <= ' ')
+                end--;
+            if (end == start)
+                throw new IOException("Invalid .vec format: empty value at offset " + start);
+            if (n == out.length)
+                throw new IOException("Invalid .vec format: more values than indices");
+            out[n++] = Float.parseFloat(s.substring(start, end));
+        }
+        return n;
+    }
+
+    private static boolean isSeparator(char c) {
+        return c == ',' || c <= ' ';
+    }
+
+    private static boolean isWhitespaceOnly(String s) {
+        for (int i = 0; i < s.length(); i++)
+            if (s.charAt(i) > ' ')
+                return false;
+        return true;
     }
 
     private float[] readNextSiftEmbedding() throws IOException {
@@ -269,18 +354,17 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         return vector;
     }
 
-    @SuppressWarnings("unchecked")
     private static String encodeSparseToBase64(Object sparseEmbedding) {
-        List<Object> embedding = (List<Object>) sparseEmbedding;
-        List<Integer> indices = (List<Integer>) embedding.get(0);
-        List<Float> values = (List<Float>) embedding.get(1);
+        Object[] embedding = (Object[]) sparseEmbedding;
+        int[] indices = (int[]) embedding[0];
+        float[] values = (float[]) embedding[1];
 
-        int size = indices.size();
+        int size = indices.length;
         ByteBuffer bb = ByteBuffer.allocate(4 + size * 8).order(ByteOrder.LITTLE_ENDIAN);
         bb.putInt(size);
         for (int i = 0; i < size; i++) {
-            bb.putInt(indices.get(i));
-            bb.putFloat(values.get(i));
+            bb.putInt(indices[i]);
+            bb.putFloat(values[i]);
         }
         return Base64.getEncoder().encodeToString(bb.array());
     }
