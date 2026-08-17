@@ -277,6 +277,12 @@ public class WorkLoadGenerate extends Task{
                         // is re-checked next iteration instead of being stuck here indefinitely.
                         logger.error(this.taskName + ": bulkInsert (create) batch failed: " + e.toString(), e);
                         this.result = false;
+                        // A real cancel_task() interrupt must still end the task - do not swallow it
+                        // and retry, or hard cancellation becomes as ineffective as stop_task() is.
+                        if (Thread.currentThread().isInterrupted()) {
+                            logger.error(this.taskName + ": interrupted, stopping");
+                            return;
+                        }
                     }
                 }
             }
@@ -304,6 +310,10 @@ public class WorkLoadGenerate extends Task{
                     } catch (Exception e) {
                         logger.error(this.taskName + ": bulkUpsert (update) batch failed: " + e.toString(), e);
                         this.result = false;
+                        if (Thread.currentThread().isInterrupted()) {
+                            logger.error(this.taskName + ": interrupted, stopping");
+                            return;
+                        }
                     }
                 }
             }
@@ -328,6 +338,10 @@ public class WorkLoadGenerate extends Task{
                     } catch (Exception e) {
                         logger.error(this.taskName + ": bulkInsert (expiry) batch failed: " + e.toString(), e);
                         this.result = false;
+                        if (Thread.currentThread().isInterrupted()) {
+                            logger.error(this.taskName + ": interrupted, stopping");
+                            return;
+                        }
                     }
                 }
             }
@@ -355,6 +369,10 @@ public class WorkLoadGenerate extends Task{
                     } catch (Exception e) {
                         logger.error(this.taskName + ": bulkDelete batch failed: " + e.toString(), e);
                         this.result = false;
+                        if (Thread.currentThread().isInterrupted()) {
+                            logger.error(this.taskName + ": interrupted, stopping");
+                            return;
+                        }
                     }
                 }
             }
@@ -398,6 +416,10 @@ public class WorkLoadGenerate extends Task{
                     } catch (Exception e) {
                         logger.error(this.taskName + ": bulkGets (read) batch failed: " + e.toString(), e);
                         this.result = false;
+                        if (Thread.currentThread().isInterrupted()) {
+                            logger.error(this.taskName + ": interrupted, stopping");
+                            return;
+                        }
                     }
                 }
             }
