@@ -87,6 +87,16 @@ graph TD
   20. Callers do not need to compute a concurrency value.
 - **Unranked tasks** (`workerIndex` left at 0, e.g. the standalone CLI loaders) keep pure
   FIFO ordering, so their behavior is unchanged.
+- **Skipping drained workers**: workers of one `/doc_load` share a generator, so once it
+  is empty the ones still queued have nothing to do — but a caller waits for all of them,
+  and on a wide run they are behind the entire run's work. The first worker to see an
+  empty generator calls `Task.notifyWorkExhausted()`, and `TaskGroup` cancels the
+  siblings that never started. `Task.claimForExecution()` decides who owns a task, so a
+  *running* worker is never skipped: `Future.cancel(false)` alone would report the task
+  cancelled while its runnable is still writing docs (a FutureTask stays in state `NEW`
+  for the whole run), which would tell the caller a load had finished mid-flight.
+- **Disjoint-range loads** (SIFT/MSMARCO) must not join a `TaskGroup` — each of their
+  workers owns its own doc range, so none is redundant.
 
 ### Work flow of loading
 sequenceDiagram

@@ -412,8 +412,15 @@ public class WorkLoadGenerate extends Task{
                     this.update_subdoc_failed_mutation_result("remove", failedMutations, result);
                 }
             }
-            if(ops == 0)
+            if(ops == 0) {
+                // Shared generator is empty and cannot refill (create cursors are
+                // monotonic; read/update/expiry reset inside their has_next checks
+                // while iterations remain). Any sibling still queued would reach this
+                // same point, so release them instead of leaving the caller waiting
+                // for them to be scheduled.
+                this.notifyWorkExhausted();
                 break;
+            }
             else if(ops < dg.ws.ops/dg.ws.workers && flag) {
                 flag = false;
                 continue;
@@ -484,6 +491,12 @@ public class WorkLoadGenerate extends Task{
 
     @Override
     public void run() {
+        if (!this.claimForExecution()) {
+            // skipTask() got here first: a sibling already drained the shared
+            // generator, so there is nothing for this worker to do.
+            this.result = true;
+            return;
+        }
         if (this.sdkClientPool != null) {
             try {
                 // Pool blocks internally until a client is available (up to its configured timeout).

@@ -14,6 +14,7 @@ import couchbase.sdk.Result;
 import utils.common.FileDownload;
 import utils.val.MSMARCOEmbeddingProduct;
 import utils.taskmanager.Task;
+import utils.taskmanager.TaskGroup;
 import utils.taskmanager.TaskManager;
 
 import org.apache.commons.cli.CommandLine;
@@ -781,6 +782,12 @@ public class TaskRequest {
                           ", Requested workers=" + ws.workers +
                           ", Effective workers=" + effectiveWorkers);
 
+        // Workers of this load all pull from the same generator 'dg', so once it is
+        // drained the ones that never got a thread have nothing to do. Group them so
+        // the first worker to see an empty generator can release the rest.
+        TaskGroup taskGroup = new TaskGroup();
+        taskGroup.setManager(TaskRequest.taskManager);
+
         // Only spawn effective workers
         for (int i = 0; i < effectiveWorkers; i++) {
             String th_name = task_name + "_" + i;
@@ -793,6 +800,7 @@ public class TaskRequest {
             // load submitted late still starts making progress immediately instead of
             // waiting behind the full worker set of the loads before it.
             wlg.workerIndex = i;
+            taskGroup.add(wlg);
             TaskRequest.loader_tasks.put(th_name, wlg);
 
             task_names.add(th_name);

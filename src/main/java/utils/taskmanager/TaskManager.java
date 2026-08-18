@@ -2,6 +2,7 @@ package utils.taskmanager;
 
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 
@@ -41,10 +42,34 @@ public class TaskManager {
         this.tasks.put(task.taskName, future);
     }
 
+    /**
+     * Cancel a task whose work a sibling already finished, so a caller waiting on the
+     * whole group is not held up by a worker that would exit immediately anyway.
+     * Does nothing to a task that is already running or done - cancel(false) never
+     * interrupts work in flight.
+     */
+    public void skipTask(Task task) {
+        Future future = this.tasks.get(task.taskName);
+        if (future == null || future.isDone()) {
+            return;
+        }
+        // Lose the claim => the task is already executing; leave it to finish. Only a
+        // task that has not started can be skipped, otherwise the caller would be told
+        // the work is done while it is still in flight.
+        if (!task.claimForExecution()) {
+            return;
+        }
+        task.skipped = true;
+        task.result = true;
+        future.cancel(false);
+    }
+
     public void getAllTaskResult() {
         for (String taskName : this.tasks.keySet()) {
             try {
                 this.tasks.get(taskName).get();
+                this.tasks.remove(taskName);
+            } catch (CancellationException e) {
                 this.tasks.remove(taskName);
             } catch (InterruptedException | ExecutionException e) {
                 e.printStackTrace();
@@ -72,6 +97,13 @@ public class TaskManager {
         try {
             future.get();
             this.tasks.remove(task.taskName);
+        } catch (CancellationException e) {
+            // Skipped by skipTask(): the shared generator was already drained by a
+            // sibling, so there was no work for this one. Not a failure.
+            this.tasks.remove(task.taskName);
+            if (!task.skipped) {
+                task.result = false;
+            }
         } catch (InterruptedException | ExecutionException e) {
             e.printStackTrace();
             this.tasks.remove(task.taskName);
