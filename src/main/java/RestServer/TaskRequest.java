@@ -616,6 +616,12 @@ public class TaskRequest {
         if (task != null) {
             body.put("completed_ops", TaskRequest.taskManager.getTaskProgress(task));
             body.put("is_running", TaskRequest.taskManager.isTaskRunning(task));
+            // Additive pool visibility: lets a caller tell "my task is waiting for a
+            // thread" apart from "my task is running but stuck". Existing clients that
+            // only read completed_ops/is_running are unaffected.
+            body.put("active_tasks", TaskRequest.taskManager.getActiveTaskCount());
+            body.put("queued_tasks", TaskRequest.taskManager.getQueuedTaskCount());
+            body.put("pool_workers", TaskRequest.taskManager.getWorkerCount());
             body.put("status", true);
         } else {
             body.put("error", "Task " + this.taskName + " does not exists");
@@ -783,6 +789,10 @@ public class TaskRequest {
                     this.docTTL, this.docTTLUnit, this.trackFailures,
                     retry, this.retryStrategy);
             wlg.set_collection_for_load(this.bucketName, this.scopeName, this.collectionName);
+            // Schedule this load's worker 0 ahead of any other load's worker 1+, so a
+            // load submitted late still starts making progress immediately instead of
+            // waiting behind the full worker set of the loads before it.
+            wlg.workerIndex = i;
             TaskRequest.loader_tasks.put(th_name, wlg);
 
             task_names.add(th_name);
@@ -850,6 +860,7 @@ public class TaskRequest {
                 this.mongoClients.add(client);
                 String th_name = "Loader" + i;
                 mongo.loadgen.WorkLoadGenerate task = new mongo.loadgen.WorkLoadGenerate(th_name, dg, client);
+                task.workerIndex = i;
                 TaskRequest.mongo_loader_tasks.put(th_name, task);
                 task_names.add(th_name);
                 TimeUnit.MILLISECONDS.sleep(500);
@@ -955,6 +966,11 @@ public class TaskRequest {
                         this.durabilityLevel,
                         this.docTTL, this.docTTLUnit, this.trackFailures, retry, this.retryStrategy);
                 wlg.set_collection_for_load(this.bucketName, this.scopeName, this.collectionName);
+                // Workers here own disjoint doc ranges rather than sharing a generator,
+                // so the index only decides which range gets a thread first; every
+                // worker still runs. Ranking keeps this load from monopolising the pool
+                // ahead of other loads' first workers.
+                wlg.workerIndex = i;
                 TaskRequest.loader_tasks.put(th_name, wlg);
                 task_names.add(th_name);
             }
@@ -1086,6 +1102,7 @@ public class TaskRequest {
                         this.durabilityLevel,
                         this.docTTL, this.docTTLUnit, this.trackFailures, retry, this.retryStrategy);
                 wlg.set_collection_for_load(this.bucketName, this.scopeName, this.collectionName);
+                wlg.workerIndex = i;
                 pendingTasks.put(th_name, wlg);
                 task_names.add(th_name);
             }

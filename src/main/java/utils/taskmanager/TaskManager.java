@@ -3,18 +3,33 @@ package utils.taskmanager;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 public class TaskManager {
     private int workers;
-    private ExecutorService poolExecutor;
+    private RankedThreadPoolExecutor poolExecutor;
     private ConcurrentHashMap<String, Future> tasks = new ConcurrentHashMap<String, Future>();
 
     public TaskManager(int workers) {
         this.workers = workers;
-        this.poolExecutor = Executors.newFixedThreadPool(this.workers);
+        // Same fixed pool size as before; only the dequeue order changes, so that a
+        // load's Nth worker never outranks another load's 1st. See
+        // RankedThreadPoolExecutor for why FIFO starves later loads.
+        this.poolExecutor = new RankedThreadPoolExecutor(this.workers);
+    }
+
+    public int getWorkerCount() {
+        return this.workers;
+    }
+
+    // Pool visibility for callers/diagnostics: how many tasks are executing right now
+    // versus waiting for a thread.
+    public int getActiveTaskCount() {
+        return this.poolExecutor.getActiveCount();
+    }
+
+    public int getQueuedTaskCount() {
+        return this.poolExecutor.getQueue().size();
     }
 
     public void shutdown() {
