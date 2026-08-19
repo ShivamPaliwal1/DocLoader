@@ -45,23 +45,31 @@ public class TaskManager {
     /**
      * Cancel a task whose work a sibling already finished, so a caller waiting on the
      * whole group is not held up by a worker that would exit immediately anyway.
-     * Does nothing to a task that is already running or done - cancel(false) never
-     * interrupts work in flight.
+     *
+     * In-flight work is protected by the claim, not by cancel(false): a FutureTask stays
+     * in state NEW for as long as its runnable is executing, so cancelling a *running*
+     * task succeeds and makes get() throw straight away while the work continues in the
+     * background - the caller would be told the load had finished mid-flight. Winning
+     * claimForExecution() is what proves the task has not started.
      */
     public void skipTask(Task task) {
         Future future = this.tasks.get(task.taskName);
         if (future == null || future.isDone()) {
             return;
         }
-        // Lose the claim => the task is already executing; leave it to finish. Only a
-        // task that has not started can be skipped, otherwise the caller would be told
-        // the work is done while it is still in flight.
+        // Lose the claim => the task is already executing; leave it to finish.
         if (!task.claimForExecution()) {
             return;
         }
         task.skipped = true;
         task.result = true;
-        future.cancel(false);
+        if (future.cancel(false) && future instanceof Runnable) {
+            // Drop it from the queue rather than leaving a dead entry for a worker to
+            // dequeue later. Skips are the common case on a wide run - thousands of
+            // them - so leaving them in place would burn scheduling cycles and make
+            // getQueuedTaskCount() report a backlog that no longer exists.
+            this.poolExecutor.remove((Runnable) future);
+        }
     }
 
     public void getAllTaskResult() {

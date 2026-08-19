@@ -1,6 +1,7 @@
 package utils.taskmanager;
 
 import java.util.Comparator;
+import java.util.concurrent.Callable;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.RunnableFuture;
@@ -26,6 +27,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * Tasks that never set workerIndex all sit at index 0 and therefore stay pure FIFO,
  * making this a no-op for every existing single-load caller.
+ *
+ * Every route into the queue - submit(Runnable), submit(Callable), execute(Runnable) -
+ * stamps a rank and a sequence number from the same counter, so work submitted through
+ * one route can neither jump ahead of nor be starved by work submitted through another.
  */
 public class RankedThreadPoolExecutor extends ThreadPoolExecutor {
 
@@ -44,9 +49,34 @@ public class RankedThreadPoolExecutor extends ThreadPoolExecutor {
                                       SUBMISSION_SEQ.incrementAndGet());
     }
 
+    // A Callable carries no rank of its own; give it index 0 (the same default an
+    // unranked Task gets) and a real sequence number so it stays FIFO against its peers
+    // instead of landing at the front of the queue.
+    @Override
+    protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
+        return new RankedFutureTask<>(callable, 0, SUBMISSION_SEQ.incrementAndGet());
+    }
+
+    // execute() bypasses newTaskFor entirely. Wrapping here - rather than leaving the
+    // runnable unstamped - keeps one sequence across all submission routes. The wrapper
+    // only delegates run(), so exceptions still reach the thread's handler exactly as
+    // they would for a bare execute().
+    @Override
+    public void execute(Runnable command) {
+        if (command instanceof RankedFutureTask || command instanceof RankedRunnable) {
+            super.execute(command);
+            return;
+        }
+        super.execute(new RankedRunnable(command, rankOf(command),
+                                         SUBMISSION_SEQ.incrementAndGet()));
+    }
+
     private static int rankOf(Runnable runnable) {
         if (runnable instanceof RankedFutureTask) {
             return ((RankedFutureTask<?>) runnable).rank;
+        }
+        if (runnable instanceof RankedRunnable) {
+            return ((RankedRunnable) runnable).rank;
         }
         if (runnable instanceof Task) {
             return ((Task) runnable).workerIndex;
@@ -58,9 +88,13 @@ public class RankedThreadPoolExecutor extends ThreadPoolExecutor {
         if (runnable instanceof RankedFutureTask) {
             return ((RankedFutureTask<?>) runnable).seq;
         }
-        // Anything submitted through execute() rather than submit() is unranked;
-        // treat it as index 0 / earliest so it keeps FIFO semantics.
-        return 0;
+        if (runnable instanceof RankedRunnable) {
+            return ((RankedRunnable) runnable).seq;
+        }
+        // Unreachable for anything this executor enqueues: submit() and execute() both
+        // stamp their work above. Sorting last keeps a hypothetical unstamped runnable
+        // from displacing work that is already waiting.
+        return Long.MAX_VALUE;
     }
 
     static class RankedFutureTask<T> extends FutureTask<T> {
@@ -71,6 +105,29 @@ public class RankedThreadPoolExecutor extends ThreadPoolExecutor {
             super(runnable, result);
             this.rank = rank;
             this.seq = seq;
+        }
+
+        RankedFutureTask(Callable<T> callable, int rank, long seq) {
+            super(callable);
+            this.rank = rank;
+            this.seq = seq;
+        }
+    }
+
+    static class RankedRunnable implements Runnable {
+        final Runnable delegate;
+        final int rank;
+        final long seq;
+
+        RankedRunnable(Runnable delegate, int rank, long seq) {
+            this.delegate = delegate;
+            this.rank = rank;
+            this.seq = seq;
+        }
+
+        @Override
+        public void run() {
+            this.delegate.run();
         }
     }
 
