@@ -500,6 +500,14 @@ public class WorkLoadGenerate extends Task{
      * collection (the CLI loaders) already knows its own.
      */
     private Collection targetCollection() {
+        if (this.sdk == null) {
+            // A load with no KV client (Elasticsearch-only). The four bulk mutation
+            // sites guard on sdk != null and skip the KV call, so they never touch
+            // this; reads/subdocs/retry do not guard and would have failed on a null
+            // client before this change too. Resolving eagerly must not break the
+            // mutation path that did tolerate it.
+            return null;
+        }
         if (this.sdkClientPool != null) {
             return this.sdk.collection(this.scope, this.collection);
         }
