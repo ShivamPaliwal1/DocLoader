@@ -19,6 +19,10 @@ public abstract class Task implements Runnable{
     // True when this task was cancelled before it ever ran because the work it
     // would have done was already finished by a sibling. Not a failure.
     public volatile boolean skipped = false;
+    // True once a pool thread has actually begun executing this task. A task that has
+    // never been dequeued is waiting for a thread, which is a queueing question, not a
+    // hang - callers polling for progress must not time it out as a stall.
+    public volatile boolean started = false;
     // Set only for workers that share one document generator with their siblings.
     public TaskGroup group = null;
     // Won by exactly one of: the thread about to execute this task, or skipTask()
@@ -77,6 +81,7 @@ public abstract class Task implements Runnable{
             this.result = true;
             return;
         }
+        this.started = true;
         this.runTask();
     }
 

@@ -21,7 +21,10 @@ public class SDKClient {
     private Bucket bucketObj;
     private Cluster cluster;
 
-    public Collection connection;
+    // Resolved once, for the scope/collection this client was constructed with.
+    // Never reassigned after initialiseSDK(): a client handed out to one caller must
+    // never be re-pointed at a different collection by a second caller.
+    private volatile Collection defaultCollection;
 
     public SDKClient(Server master, String bucket, String scope, String collection) {
         super();
@@ -47,7 +50,8 @@ public class SDKClient {
         logger.info("Connection to the cluster");
         this.connectCluster();
         this.connectBucket(bucket);
-        this.selectCollection(scope, collection);
+        this.defaultCollection = this.bucketObj.scope(this.scope)
+                                               .collection(this.collection);
     }
 
     public void connectCluster(){
@@ -76,9 +80,23 @@ public class SDKClient {
         this.bucketObj = this.cluster.bucket(bucket);
     }
 
-    public void selectCollection(String scope, String collection) {
-        this.connection = this.bucketObj.scope(scope).collection(collection);
-        this.scope = scope;
-        this.collection = collection;
+    /**
+     * Resolve a collection handle for this client's bucket.
+     *
+     * Deliberately a pure function of its arguments: the caller keeps the handle in a
+     * local, so a client shared by many concurrent workers has no per-collection state
+     * for one worker to overwrite while another is mid-batch. Cluster, Bucket and
+     * Collection are all thread-safe and meant to be shared.
+     */
+    public Collection collection(String scope, String collection) {
+        return this.bucketObj.scope(scope).collection(collection);
+    }
+
+    /**
+     * The collection this client was constructed for. Used by the CLI loaders, which
+     * build one client per run rather than going through SDKClientPool.
+     */
+    public Collection collection() {
+        return this.defaultCollection;
     }
 }
