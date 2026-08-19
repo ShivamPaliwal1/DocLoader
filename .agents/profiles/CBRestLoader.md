@@ -95,6 +95,9 @@ graph TD
   *running* worker is never skipped: `Future.cancel(false)` alone would report the task
   cancelled while its runnable is still writing docs (a FutureTask stays in state `NEW`
   for the whole run), which would tell the caller a load had finished mid-flight.
+- **Writing a new Task**: implement `runTask()`, not `run()`. `Task.run()` is final and
+  takes the claim before calling `runTask()`, so a subclass cannot accidentally leave
+  itself open to being cancelled mid-flight by `skipTask()`.
 - **Disjoint-range loads** (SIFT/MSMARCO) must not join a `TaskGroup` — each of their
   workers owns its own doc range, so none is redundant.
 

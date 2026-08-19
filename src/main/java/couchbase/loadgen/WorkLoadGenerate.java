@@ -490,13 +490,7 @@ public class WorkLoadGenerate extends Task{
     }
 
     @Override
-    public void run() {
-        if (!this.claimForExecution()) {
-            // skipTask() got here first: a sibling already drained the shared
-            // generator, so there is nothing for this worker to do.
-            this.result = true;
-            return;
-        }
+    protected void runTask() {
         if (this.sdkClientPool != null) {
             try {
                 // Pool blocks internally until a client is available (up to its configured timeout).

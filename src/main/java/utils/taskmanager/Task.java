@@ -63,7 +63,26 @@ public abstract class Task implements Runnable{
         }
     }
 
+    /**
+     * Final on purpose. skipTask() is only safe while every task acquires the claim
+     * before doing any work - a subclass that forgot to would let skipTask() cancel it
+     * mid-flight, and the caller would see CancellationException while documents were
+     * still being written. Claiming here means no subclass can forget.
+     */
     @Override
-    public abstract void run() throws RuntimeException;
+    public final void run() throws RuntimeException {
+        if (!this.claimForExecution()) {
+            // skipTask() got here first: the work this task would have done is already
+            // finished, so there is nothing left to do.
+            this.result = true;
+            return;
+        }
+        this.runTask();
+    }
+
+    /**
+     * The task body. Runs only once this task has won its claim.
+     */
+    protected abstract void runTask() throws RuntimeException;
 
 }

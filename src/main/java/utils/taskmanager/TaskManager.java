@@ -74,12 +74,22 @@ public class TaskManager {
 
     public void getAllTaskResult() {
         for (String taskName : this.tasks.keySet()) {
+            // Another thread (getTaskResult) may have consumed this entry already.
+            Future future = this.tasks.get(taskName);
+            if (future == null) {
+                continue;
+            }
             try {
-                this.tasks.get(taskName).get();
+                future.get();
                 this.tasks.remove(taskName);
             } catch (CancellationException e) {
                 this.tasks.remove(taskName);
-            } catch (InterruptedException | ExecutionException e) {
+            } catch (InterruptedException e) {
+                // Restore the flag and stop waiting: swallowing it here would hide a
+                // shutdown request from everything further up the stack.
+                Thread.currentThread().interrupt();
+                return;
+            } catch (ExecutionException e) {
                 e.printStackTrace();
             }
         }
