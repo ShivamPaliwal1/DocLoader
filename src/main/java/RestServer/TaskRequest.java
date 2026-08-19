@@ -623,6 +623,9 @@ public class TaskRequest {
             body.put("active_tasks", TaskRequest.taskManager.getActiveTaskCount());
             body.put("queued_tasks", TaskRequest.taskManager.getQueuedTaskCount());
             body.put("pool_workers", TaskRequest.taskManager.getWorkerCount());
+            // False while the task is still queued for a thread. A caller watching for
+            // a stall must not run its clock on a task the pool has never started.
+            body.put("has_started", task.started);
             body.put("status", true);
         } else {
             body.put("error", "Task " + this.taskName + " does not exists");

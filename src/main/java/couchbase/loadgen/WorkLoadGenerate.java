@@ -22,6 +22,7 @@ import com.couchbase.client.core.error.DocumentExistsException;
 import com.couchbase.client.core.error.DocumentNotFoundException;
 import com.couchbase.client.core.error.ServerOutOfMemoryException;
 import com.couchbase.client.core.error.TimeoutException;
+import com.couchbase.client.java.Collection;
 import com.couchbase.client.java.kv.GetOptions;
 import com.couchbase.client.java.kv.InsertOptions;
 import com.couchbase.client.java.kv.RemoveOptions;
@@ -174,6 +175,10 @@ public class WorkLoadGenerate extends Task{
     public void actual_run() {
         this.result = true;
         logger.info("Starting " + this.taskName);
+        // Resolved once into a local. Never stored on the shared SDKClient: this worker
+        // must keep writing to its own collection even though other workers are using
+        // the same client for theirs.
+        final Collection target = this.targetCollection();
         // Set timeout in WorkLoadSettings
         this.dg.ws.setTimeoutDuration(60, "seconds");
         // Set Durability in WorkLoadSettings
@@ -259,7 +264,7 @@ public class WorkLoadGenerate extends Task{
                     }
                     List<Result> result = new ArrayList<Result>();
                     if(this.sdk != null)
-                        result = docops.bulkInsert(this.sdk.connection, docs, setOptions);
+                        result = docops.bulkInsert(target, docs, setOptions);
                     ops += dg.ws.batchSize*dg.ws.creates/100;
                     this.completedOps.addAndGet(docs.size());
                     if(this.trackFailures && result.size()>0){
@@ -281,7 +286,7 @@ public class WorkLoadGenerate extends Task{
                     }
                     List<Result> result = new ArrayList<Result>();
                     if(this.sdk != null)
-                        result = docops.bulkUpsert(this.sdk.connection, docs, upsertOptions);
+                        result = docops.bulkUpsert(target, docs, upsertOptions);
                     ops += dg.ws.batchSize*dg.ws.updates/100;
                     this.completedOps.addAndGet(docs.size());
                     if(this.trackFailures && result.size()>0){
@@ -300,7 +305,7 @@ public class WorkLoadGenerate extends Task{
                     flag = true;
                     List<Result> result = new ArrayList<Result>();
                     if(this.sdk != null)
-                        result = docops.bulkInsert(this.sdk.connection, docs, expiryOptions);
+                        result = docops.bulkInsert(target, docs, expiryOptions);
                     ops += dg.ws.batchSize*dg.ws.expiry/100;
                     this.completedOps.addAndGet(docs.size());
                     if(this.trackFailures && result.size()>0){
@@ -319,7 +324,7 @@ public class WorkLoadGenerate extends Task{
                     flag = true;
                     List<Result> result = new ArrayList<Result>();
                     if(this.sdk != null)
-                        result = docops.bulkDelete(this.sdk.connection, docs, removeOptions);
+                        result = docops.bulkDelete(target, docs, removeOptions);
                     if(this.dg.ws.elastic) {
                         this.esClient.deleteDocs(this.collection.replace("_", ""), docs);
                     }
@@ -339,7 +344,7 @@ public class WorkLoadGenerate extends Task{
                 List<Tuple2<String, Object>> docs = dg.nextReadBatch();
                 if (docs.size()>0) {
                     flag = true;
-                    List<Tuple2<String, Object>> res = docops.bulkGets(this.sdk.connection, docs, getOptions);
+                    List<Tuple2<String, Object>> res = docops.bulkGets(target, docs, getOptions);
                     if (this.dg.ws.validate) {
                         Map<Object, Object> trnx_res = res.stream().collect(Collectors.toMap(t -> t.get(0), t -> t.get(1)));
                         Map<Object, Object> trnx_docs = docs.stream().collect(Collectors.toMap(t -> t.get(0), t -> t.get(1)));
@@ -351,14 +356,14 @@ public class WorkLoadGenerate extends Task{
                                 String b = om.writeValueAsString(trnx_docs.get(name));
                                 if(this.dg.ws.expectDeleted) {
                                     if(!a.contains(DocumentNotFoundException.class.getSimpleName())) {
-                                        System.out.println("Validation failed for key: " + this.sdk.scope + ":" + this.sdk.collection + ":" + name);
+                                        System.out.println("Validation failed for key: " + this.scope + ":" + this.collection + ":" + name);
                                         System.out.println("Actual Value - " + a);
                                         System.out.println("Expected Value - " + b);
                                         System.out.println(this.taskName + " is completed!");
                                         return;
                                     }
                                 } else if(!a.equals(b) && !a.contains("TimeoutException")){
-                                    System.out.println("Validation failed for key: " + this.sdk.scope + ":" + this.sdk.collection + ":" + name);
+                                    System.out.println("Validation failed for key: " + this.scope + ":" + this.collection + ":" + name);
                                     System.out.println("Actual Value - " + a);
                                     System.out.println("Expected Value - " + b);
                                     System.out.println(this.taskName + " is completed!");
@@ -379,7 +384,7 @@ public class WorkLoadGenerate extends Task{
                 docs = dg.nextSubDocBatch("insert");
                 if (docs.size()>0) {
                     flag = true;
-                    List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(this.sdk.connection, docs, mutateInOptions);
+                    List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(target, docs, mutateInOptions);
                     ops += dg.ws.batchSize*dg.ws.subdocs/100;
                     this.completedOps.addAndGet(docs.size());
                     this.update_subdoc_failed_mutation_result("insert", failedMutations, result);
@@ -388,7 +393,7 @@ public class WorkLoadGenerate extends Task{
                 docs = dg.nextSubDocBatch("upsert");
                 if (docs.size()>0) {
                     flag = true;
-                    List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(this.sdk.connection, docs, mutateInOptions);
+                    List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(target, docs, mutateInOptions);
                     ops += dg.ws.batchSize*dg.ws.subdocs/100;
                     this.completedOps.addAndGet(docs.size());
                     this.update_subdoc_failed_mutation_result("upsert", failedMutations, result);
@@ -397,7 +402,7 @@ public class WorkLoadGenerate extends Task{
                 List<Tuple2<String,List<LookupInSpec>>> lookup_docs = dg.nextSubDocLookupBatch();
                 if (lookup_docs.size()>0) {
                     flag = true;
-                    List<HashMap<String,Object>> result = subDocOps.bulkGetSubDocOperation(this.sdk.connection, lookup_docs, lookupInOptions);
+                    List<HashMap<String,Object>> result = subDocOps.bulkGetSubDocOperation(target, lookup_docs, lookupInOptions);
                     ops += dg.ws.batchSize*dg.ws.subdocs/100;
                     this.completedOps.addAndGet(lookup_docs.size());
                     this.update_subdoc_failed_mutation_result("lookup", failedMutations, result);
@@ -406,7 +411,7 @@ public class WorkLoadGenerate extends Task{
                 docs = dg.nextSubDocBatch("remove");
                 if (docs.size()>0) {
                     flag = true;
-                    List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(this.sdk.connection, docs, mutateInOptions);
+                    List<HashMap<String,Object>> result = subDocOps.bulkSubDocOperation(target, docs, mutateInOptions);
                     ops += dg.ws.batchSize*dg.ws.subdocs/100;
                     this.completedOps.addAndGet(docs.size());
                     this.update_subdoc_failed_mutation_result("remove", failedMutations, result);
@@ -447,7 +452,7 @@ public class WorkLoadGenerate extends Task{
                     switch(optype.getKey()) {
                     case "create":
                         try {
-                            docops.insert(r.id(), r.document(), this.sdk.connection, setOptions);
+                            docops.insert(r.id(), r.document(), target, setOptions);
                             failedMutations.get(optype.getKey()).remove(r);
                         } catch (TimeoutException|ServerOutOfMemoryException e) {
                             System.out.println("Retry Create failed for key: " + r.id());
@@ -460,7 +465,7 @@ public class WorkLoadGenerate extends Task{
                         }
                     case "update":
                         try {
-                            docops.upsert(r.id(), r.document(), this.sdk.connection, upsertOptions);
+                            docops.upsert(r.id(), r.document(), target, upsertOptions);
                             failedMutations.get(optype.getKey()).remove(r);
                         } catch (TimeoutException|ServerOutOfMemoryException e) {
                             System.out.println("Retry update failed for key: " + r.id());
@@ -474,7 +479,7 @@ public class WorkLoadGenerate extends Task{
                         }
                     case "delete":
                         try {
-                            docops.delete(r.id(), this.sdk.connection, removeOptions);
+                            docops.delete(r.id(), target, removeOptions);
                             failedMutations.get(optype.getKey()).remove(r);
                         } catch (TimeoutException|ServerOutOfMemoryException e) {
                             System.out.println("Retry delete failed for key: " + r.id());
@@ -489,26 +494,26 @@ public class WorkLoadGenerate extends Task{
         }
     }
 
+    /**
+     * The collection this worker loads. Pool clients are shared across collections, so
+     * the handle is resolved per worker and kept local; a client built for one specific
+     * collection (the CLI loaders) already knows its own.
+     */
+    private Collection targetCollection() {
+        if (this.sdkClientPool != null) {
+            return this.sdk.collection(this.scope, this.collection);
+        }
+        return this.sdk.collection();
+    }
+
     @Override
     protected void runTask() {
         if (this.sdkClientPool != null) {
-            try {
-                // Pool blocks internally until a client is available (up to its configured timeout).
-                // No busy-poll needed here — blocking in the pool is cheaper and has no retry cap.
-                this.sdk = this.sdkClientPool.get_client_for_bucket(
-                        this.bucket_name, this.scope, this.collection);
-            } catch (InterruptedException e) {
-                logger.error("Interrupted while waiting for SDK client for bucket "
-                        + this.bucket_name, e);
-                Thread.currentThread().interrupt();
-                this.result = false;
-                return;
-            } catch (Exception e) {
-                logger.error("Error acquiring SDK client for bucket "
-                        + this.bucket_name + ": " + e.getMessage(), e);
-            }
+            // One shared client per bucket - never blocks, never runs out.
+            this.sdk = this.sdkClientPool.get_client_for_bucket(this.bucket_name);
             if (this.sdk == null) {
-                logger.error("Failed to acquire SDK client for bucket " + this.bucket_name);
+                logger.error("No SDK client for bucket " + this.bucket_name
+                        + " - create_clients was not called for it");
                 this.result = false;
                 return;
             }
@@ -519,10 +524,6 @@ public class WorkLoadGenerate extends Task{
         catch (Exception e) {
             logger.error("Unhandled exception in task " + this.taskName + ": " + e.getMessage(), e);
             this.result = false;
-        }
-        finally{
-            if (this.sdkClientPool != null && this.sdk != null)
-                this.sdkClientPool.release_client(this.sdk);
         }
     }
 }
