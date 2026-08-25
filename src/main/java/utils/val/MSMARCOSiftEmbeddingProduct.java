@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.Base64;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
@@ -248,6 +249,17 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         if (indexCount != valueCount) {
             throw new IOException("Indices and values arrays have different lengths: "
                     + indexCount + " vs " + valueCount);
+        }
+        // countElements() counts separators while the parsers skip runs of them, so an
+        // empty element -- a trailing or doubled comma -- makes count overshoot what is
+        // actually parsed. Trim to the parsed length: leaving the surplus slots at their
+        // defaults would inject a phantom index 0 / value 0.0 into the document, and the
+        // check above cannot catch it because both sides undercount identically. The
+        // split(",") this replaced dropped trailing empties, so trimming keeps that
+        // behaviour. Never taken on well-formed input.
+        if (indexCount != count) {
+            indices = Arrays.copyOf(indices, indexCount);
+            values = Arrays.copyOf(values, indexCount);
         }
         return new Object[] { indices, values };
     }
