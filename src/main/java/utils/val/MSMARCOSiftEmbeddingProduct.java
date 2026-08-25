@@ -10,11 +10,12 @@ import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
-import java.util.List;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -34,8 +35,11 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
     private final String sparseSourcePath;
     private final String siftSourcePath;
 
-    // Sparse: offset index file for O(1) seeks (same approach as MSMARCOEmbeddingProduct)
-    private final long[] lineOffsets;
+    // Sparse: offset index file for O(1) seeks (same approach as MSMARCOEmbeddingProduct).
+    // Offsets are read one at a time via a positional read rather than slurped into a
+    // long[] — for an 8.8M-line source that array is ~70MB per generator instance.
+    // Path only, not an open channel: see offsetOf().
+    private String idxFilePath;
     private FileChannel sparseChannel;
     private BufferedReader sparseReader;
 
@@ -56,7 +60,7 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         this.siftSourcePath = resolveSiftSourcePath(ws);
 
         try {
-            this.lineOffsets = loadOrBuildIndex(sparseSourcePath);
+            this.idxFilePath = ensureIndex(sparseSourcePath);
             this.sparseChannel = FileChannel.open(Paths.get(sparseSourcePath), StandardOpenOption.READ);
             this.siftChannel = FileChannel.open(Paths.get(siftSourcePath), StandardOpenOption.READ);
 
@@ -81,39 +85,29 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         }
     }
 
-    private static synchronized long[] loadOrBuildIndex(String vecFilePath) throws IOException {
+    // Ensures the .idx sidecar exists alongside the .vec file, building it if absent,
+    // and returns its path. Synchronized to prevent concurrent workers from racing to
+    // build the same index file.
+    private static synchronized String ensureIndex(String vecFilePath) throws IOException {
         String idxFilePath = vecFilePath + ".idx";
-        if (Files.exists(Paths.get(idxFilePath))) {
-            System.out.println("Loading offset index: " + idxFilePath);
-            return loadIndex(idxFilePath);
-        }
-        return buildAndSaveIndex(vecFilePath, idxFilePath);
+        if (!Files.exists(Paths.get(idxFilePath)))
+            buildAndSaveIndex(vecFilePath, idxFilePath);
+        return idxFilePath;
     }
 
-    private static long[] loadIndex(String idxFilePath) throws IOException {
-        try (FileChannel ch = FileChannel.open(Paths.get(idxFilePath), StandardOpenOption.READ)) {
-            int numRecords = (int) (ch.size() / 8);
-            long[] offsets = new long[numRecords];
-            ByteBuffer buf = ByteBuffer.allocate(8 * 8192).order(ByteOrder.LITTLE_ENDIAN);
-            int idx = 0;
-            while (ch.read(buf) > 0) {
-                buf.flip();
-                while (buf.remaining() >= 8)
-                    offsets[idx++] = buf.getLong();
-                buf.compact();
-            }
-            return offsets;
-        }
-    }
-
-    private static long[] buildAndSaveIndex(String vecFilePath, String idxFilePath) throws IOException {
+    private static void buildAndSaveIndex(String vecFilePath, String idxFilePath) throws IOException {
         System.out.println("Building offset index for: " + vecFilePath + " -> " + idxFilePath);
         ByteBuffer readBuf = ByteBuffer.allocateDirect(STREAM_BUFFER_SIZE);
         ByteBuffer writeBuf = ByteBuffer.allocate(8 * 8192).order(ByteOrder.LITTLE_ENDIAN);
         long bytePos = 0;
 
+        // Build into a temp file and rename atomically. ensureIndex()'s exists-check only
+        // serialises workers inside one JVM; writing in place lets a second process observe
+        // a file that exists but is still being written, and read truncated offsets.
+        Path tmp = Paths.get(idxFilePath + ".tmp");
+        try {
         try (FileChannel vecCh = FileChannel.open(Paths.get(vecFilePath), StandardOpenOption.READ);
-             FileChannel idxCh = FileChannel.open(Paths.get(idxFilePath),
+             FileChannel idxCh = FileChannel.open(tmp,
                      StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
             writeBuf.putLong(0L);
@@ -137,15 +131,50 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
             writeBuf.flip();
             if (writeBuf.hasRemaining())
                 idxCh.write(writeBuf);
+            idxCh.force(true);
+        }
+        Files.move(tmp, Paths.get(idxFilePath),
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            Files.deleteIfExists(tmp);
+            throw e;
         }
 
         System.out.println("Index built: " + idxFilePath);
-        return loadIndex(idxFilePath);
+    }
+
+    // Reads the byte offset of a single line from the .idx sidecar.
+    //
+    // The channel is opened per call rather than held for this object's lifetime. Nothing
+    // in the repo calls close() on a generator, and TaskRequest builds
+    // process_concurrency of them per request in a long-running server, so a retained
+    // channel accumulates for the JVM's lifetime -- and ulimit -n is 1024 on the volume
+    // hosts. Opening here keeps this class at the same descriptor count as before this
+    // change, where loadIndex() opened and closed the index inside try-with-resources.
+    //
+    // Not a hot path: seekToRecord() is the only caller, reached once per generator in
+    // create mode and once per iteration wrap in mutation mode, since keys arrive in
+    // ascending order and currentRecord already tracks the target.
+    private long offsetOf(long recordIndex) throws IOException {
+        ByteBuffer buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        try (FileChannel idxChannel = FileChannel.open(Paths.get(idxFilePath), StandardOpenOption.READ)) {
+            long records = idxChannel.size() / 8;
+            if (recordIndex < 0 || recordIndex >= records)
+                throw new IOException("record index " + recordIndex + " out of bounds [0, " + records
+                        + ") in " + idxFilePath);
+            long pos = recordIndex * 8L;
+            while (buf.hasRemaining()) {
+                if (idxChannel.read(buf, pos + buf.position()) < 0)
+                    throw new IOException("truncated offset index at record " + recordIndex);
+            }
+        }
+        buf.flip();
+        return buf.getLong();
     }
 
     // Seeks both sparse and SIFT channels to the given record index in O(1).
     private void seekToRecord(long recordIndex) throws IOException {
-        sparseChannel.position(lineOffsets[(int) recordIndex]);
+        sparseChannel.position(offsetOf(recordIndex));
         sparseReader = new BufferedReader(
                 new InputStreamReader(Channels.newInputStream(sparseChannel), StandardCharsets.UTF_8),
                 STREAM_BUFFER_SIZE);
@@ -208,43 +237,141 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         if (line == null) {
             throw new IOException("No more sparse embedding records available from source: " + sparseSourcePath);
         }
-        line = line.trim();
-        while (line.isEmpty()) {
+        while (isWhitespaceOnly(line)) {
             line = sparseReader.readLine();
             if (line == null) {
                 throw new IOException("No more sparse embedding records available from source: " + sparseSourcePath);
             }
-            line = line.trim();
         }
+        return parseRecord(line);
+    }
 
-        String[] parts = line.split("\t");
-        if (parts.length != 3) {
-            throw new IOException("Invalid .vec format: expected 3 tab-separated parts, got " + parts.length);
-        }
+    // Parses one "<id>\t[indices]\t[values]" record into { int[], float[] }.
+    //
+    // The pair is kept as primitive arrays rather than List<Integer>/List<Float>: at
+    // ~300 non-zeros the boxed form costs ~12KB per document against ~2.5KB here, and
+    // every in-flight batch retains batchSize x workers of them.
+    //
+    // Returned as Object[] so Jackson still emits [[indices...],[values...]], byte for
+    // byte what the nested-List form produced.
+    private static Object parseRecord(String line) throws IOException {
+        int firstTab = line.indexOf('\t');
+        int secondTab = firstTab < 0 ? -1 : line.indexOf('\t', firstTab + 1);
+        if (secondTab < 0)
+            throw new IOException("Invalid .vec format: expected 3 tab-separated parts");
 
-        String indicesStr = parts[1].trim();
-        indicesStr = indicesStr.substring(1, indicesStr.length() - 1);
-        String[] indexParts = indicesStr.split(",");
+        int indicesOpen = line.indexOf('[', firstTab + 1);
+        int indicesClose = line.lastIndexOf(']', secondTab);
+        int valuesOpen = line.indexOf('[', secondTab + 1);
+        int valuesClose = line.lastIndexOf(']');
+        if (indicesOpen < 0 || indicesClose < indicesOpen || valuesOpen < 0 || valuesClose < valuesOpen)
+            throw new IOException("Invalid .vec format: malformed index/value list");
 
-        String valuesStr = parts[2].trim();
-        valuesStr = valuesStr.substring(1, valuesStr.length() - 1);
-        String[] valueParts = valuesStr.split(",");
-        if (valueParts.length != indexParts.length) {
+        int count = countElements(line, indicesOpen + 1, indicesClose);
+        int[] indices = new int[count];
+        float[] values = new float[count];
+        int indexCount = parseIndices(line, indicesOpen + 1, indicesClose, indices);
+        int valueCount = parseValues(line, valuesOpen + 1, valuesClose, values);
+        if (indexCount != valueCount) {
             throw new IOException("Indices and values arrays have different lengths: "
-                    + indexParts.length + " vs " + valueParts.length);
+                    + indexCount + " vs " + valueCount);
         }
-
-        List<Integer> indicesList = new ArrayList<>(indexParts.length);
-        List<Float> valuesList = new ArrayList<>(indexParts.length);
-        for (int i = 0; i < indexParts.length; i++) {
-            indicesList.add(Integer.parseInt(indexParts[i].trim()));
-            valuesList.add(Float.parseFloat(valueParts[i].trim()));
+        // countElements() counts separators while the parsers skip runs of them, so an
+        // empty element -- a trailing or doubled comma -- makes count overshoot what is
+        // actually parsed. Trim to the parsed length: leaving the surplus slots at their
+        // defaults would inject a phantom index 0 / value 0.0 into the document, and the
+        // check above cannot catch it because both sides undercount identically. The
+        // split(",") this replaced dropped trailing empties, so trimming keeps that
+        // behaviour. Never taken on well-formed input.
+        if (indexCount != count) {
+            indices = Arrays.copyOf(indices, indexCount);
+            values = Arrays.copyOf(values, indexCount);
         }
+        return new Object[] { indices, values };
+    }
 
-        List<Object> result = new ArrayList<>(2);
-        result.add(indicesList);
-        result.add(valuesList);
-        return result;
+    // Counts comma-separated elements in [from, to); 0 if the region is whitespace only.
+    private static int countElements(String s, int from, int to) {
+        int i = from;
+        while (i < to && s.charAt(i) <= ' ')
+            i++;
+        if (i >= to)
+            return 0;
+        int count = 1;
+        for (; i < to; i++)
+            if (s.charAt(i) == ',')
+                count++;
+        return count;
+    }
+
+    // Parses the comma-separated integers in [from, to) into out. Allocation free.
+    private static int parseIndices(String s, int from, int to, int[] out) throws IOException {
+        int n = 0;
+        int i = from;
+        while (i < to) {
+            while (i < to && isSeparator(s.charAt(i)))
+                i++;
+            if (i >= to)
+                break;
+            boolean negative = s.charAt(i) == '-';
+            if (negative || s.charAt(i) == '+')
+                i++;
+            int start = i;
+            int value = 0;
+            while (i < to) {
+                char c = s.charAt(i);
+                if (c < '0' || c > '9')
+                    break;
+                value = value * 10 + (c - '0');
+                i++;
+            }
+            if (i == start)
+                throw new IOException("Invalid .vec format: malformed index at offset " + start);
+            if (n == out.length)
+                throw new IOException("Invalid .vec format: more indices than counted");
+            out[n++] = negative ? -value : value;
+        }
+        return n;
+    }
+
+    // Parses the comma-separated floats in [from, to) into out.
+    //
+    // Float.parseFloat is kept, on a per-token substring, rather than accumulating the
+    // decimal by hand: the source prints up to 17 significant digits, past the 2^53
+    // mantissa limit under which a hand-rolled accumulator is still provably correctly
+    // rounded. parseFloat is what guarantees the emitted JSON is unchanged.
+    private static int parseValues(String s, int from, int to, float[] out) throws IOException {
+        int n = 0;
+        int i = from;
+        while (i < to) {
+            while (i < to && isSeparator(s.charAt(i)))
+                i++;
+            if (i >= to)
+                break;
+            int start = i;
+            while (i < to && s.charAt(i) != ',')
+                i++;
+            int end = i;
+            while (end > start && s.charAt(end - 1) <= ' ')
+                end--;
+            if (end == start)
+                throw new IOException("Invalid .vec format: empty value at offset " + start);
+            if (n == out.length)
+                throw new IOException("Invalid .vec format: more values than indices");
+            out[n++] = Float.parseFloat(s.substring(start, end));
+        }
+        return n;
+    }
+
+    private static boolean isSeparator(char c) {
+        return c == ',' || c <= ' ';
+    }
+
+    private static boolean isWhitespaceOnly(String s) {
+        for (int i = 0; i < s.length(); i++)
+            if (s.charAt(i) > ' ')
+                return false;
+        return true;
     }
 
     private float[] readNextSiftEmbedding() throws IOException {
@@ -265,18 +392,17 @@ public class MSMARCOSiftEmbeddingProduct implements Closeable {
         return vector;
     }
 
-    @SuppressWarnings("unchecked")
     private static String encodeSparseToBase64(Object sparseEmbedding) {
-        List<Object> embedding = (List<Object>) sparseEmbedding;
-        List<Integer> indices = (List<Integer>) embedding.get(0);
-        List<Float> values = (List<Float>) embedding.get(1);
+        Object[] embedding = (Object[]) sparseEmbedding;
+        int[] indices = (int[]) embedding[0];
+        float[] values = (float[]) embedding[1];
 
-        int size = indices.size();
+        int size = indices.length;
         ByteBuffer bb = ByteBuffer.allocate(4 + size * 8).order(ByteOrder.LITTLE_ENDIAN);
         bb.putInt(size);
         for (int i = 0; i < size; i++) {
-            bb.putInt(indices.get(i));
-            bb.putFloat(values.get(i));
+            bb.putInt(indices[i]);
+            bb.putFloat(values[i]);
         }
         return Base64.getEncoder().encodeToString(bb.array());
     }
