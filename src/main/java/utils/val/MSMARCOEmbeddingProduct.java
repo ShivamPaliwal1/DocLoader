@@ -10,7 +10,9 @@ import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Base64;
@@ -35,8 +37,8 @@ public class MSMARCOEmbeddingProduct implements Closeable {
     // that line in the .vec file. It is read one entry at a time via a positional
     // read rather than slurped into a long[] — for an 8.8M-line source that array
     // is ~70MB, and every generator instance would hold its own private copy.
-    private FileChannel idxChannel;
-    private long recordCount;
+    // Path only, not an open channel: see offsetOf().
+    private String idxFilePath;
 
     private FileChannel fileChannel;
     private BufferedReader lineReader;
@@ -54,9 +56,7 @@ public class MSMARCOEmbeddingProduct implements Closeable {
         this.sourcePath = resolveSourcePath(ws);
 
         try {
-            String idxFilePath = ensureIndex(sourcePath);
-            this.idxChannel = FileChannel.open(Paths.get(idxFilePath), StandardOpenOption.READ);
-            this.recordCount = idxChannel.size() / 8;
+            this.idxFilePath = ensureIndex(sourcePath);
             this.fileChannel = FileChannel.open(Paths.get(sourcePath), StandardOpenOption.READ);
 
             if (ws.creates > 0 && ws.dr != null) {
@@ -98,8 +98,13 @@ public class MSMARCOEmbeddingProduct implements Closeable {
         ByteBuffer writeBuf = ByteBuffer.allocate(8 * 8192).order(ByteOrder.LITTLE_ENDIAN);
         long bytePos = 0;
 
+        // Build into a temp file and rename atomically. ensureIndex()'s exists-check only
+        // serialises workers inside one JVM; writing in place lets a second process observe
+        // a file that exists but is still being written, and read truncated offsets.
+        Path tmp = Paths.get(idxFilePath + ".tmp");
+        try {
         try (FileChannel vecCh = FileChannel.open(Paths.get(vecFilePath), StandardOpenOption.READ);
-             FileChannel idxCh = FileChannel.open(Paths.get(idxFilePath),
+             FileChannel idxCh = FileChannel.open(tmp,
                      StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
 
             // Line 0 always starts at byte 0
@@ -124,21 +129,42 @@ public class MSMARCOEmbeddingProduct implements Closeable {
             writeBuf.flip();
             if (writeBuf.hasRemaining())
                 idxCh.write(writeBuf);
+            idxCh.force(true);
+        }
+        Files.move(tmp, Paths.get(idxFilePath),
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            Files.deleteIfExists(tmp);
+            throw e;
         }
 
         System.out.println("Index built: " + idxFilePath);
     }
 
-    // Reads the byte offset of a single line from the .idx sidecar. Positional read,
-    // so it does not disturb idxChannel's own position and needs no synchronization.
+    // Reads the byte offset of a single line from the .idx sidecar.
+    //
+    // The channel is opened per call rather than held for this object's lifetime. Nothing
+    // in the repo calls close() on a generator, and TaskRequest builds
+    // process_concurrency of them per request in a long-running server, so a retained
+    // channel accumulates for the JVM's lifetime -- and ulimit -n is 1024 on the volume
+    // hosts. Opening here keeps this class at the same descriptor count as before this
+    // change, where loadIndex() opened and closed the index inside try-with-resources.
+    //
+    // Not a hot path: seekToRecord() is the only caller, reached once per generator in
+    // create mode and once per iteration wrap in mutation mode, since keys arrive in
+    // ascending order and currentRecord already tracks the target.
     private long offsetOf(long recordIndex) throws IOException {
-        if (recordIndex < 0 || recordIndex >= recordCount)
-            throw new IOException("record index " + recordIndex + " out of bounds [0, " + recordCount + ")");
         ByteBuffer buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
-        long pos = recordIndex * 8L;
-        while (buf.hasRemaining()) {
-            if (idxChannel.read(buf, pos + buf.position()) < 0)
-                throw new IOException("truncated offset index at record " + recordIndex);
+        try (FileChannel idxChannel = FileChannel.open(Paths.get(idxFilePath), StandardOpenOption.READ)) {
+            long records = idxChannel.size() / 8;
+            if (recordIndex < 0 || recordIndex >= records)
+                throw new IOException("record index " + recordIndex + " out of bounds [0, " + records
+                        + ") in " + idxFilePath);
+            long pos = recordIndex * 8L;
+            while (buf.hasRemaining()) {
+                if (idxChannel.read(buf, pos + buf.position()) < 0)
+                    throw new IOException("truncated offset index at record " + recordIndex);
+            }
         }
         buf.flip();
         return buf.getLong();
@@ -393,10 +419,6 @@ public class MSMARCOEmbeddingProduct implements Closeable {
         if (fileChannel != null) {
             fileChannel.close();
             fileChannel = null;
-        }
-        if (idxChannel != null) {
-            idxChannel.close();
-            idxChannel = null;
         }
     }
 
