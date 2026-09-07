@@ -189,24 +189,29 @@ abstract class KVGenerator{
             "generate_keys_for_target_vbs", Long.class, Long.class, int[].class);
 
         if (target_vbuckets != null && target_vbuckets.length > 0) {
+            // '*_s'/'*_e' are absolute doc indexes, the same as on every other
+            // code path (TaskRequest.doc_load() sizes its worker pool from
+            // 'createEndIndex - createStartIndex', has_next_create() compares
+            // createItr against create_e). generate_keys_for_target_vbs() takes
+            // a key COUNT as its second argument, so hand it the width of the
+            // range - not '*_e' itself, which asked it for '*_e' keys and then
+            // pushed '*_e' out to '*_s + *_e'. On a (5_000_000, 5_100_000)
+            // create range that turned 100k creates into 5.1M.
             generated_create_keys = (Map<Long, String>)genKeysForTargetVBsFunc.invoke(
-                this.keys, this.ws.dr.create_s, this.ws.dr.create_e, this.target_vbuckets);
+                this.keys, this.ws.dr.create_s,
+                this.ws.dr.create_e - this.ws.dr.create_s, this.target_vbuckets);
             generated_update_keys = (Map<Long, String>)genKeysForTargetVBsFunc.invoke(
-                this.keys, this.ws.dr.update_s, this.ws.dr.update_e, this.target_vbuckets);
+                this.keys, this.ws.dr.update_s,
+                this.ws.dr.update_e - this.ws.dr.update_s, this.target_vbuckets);
             generated_read_keys = (Map<Long, String>)genKeysForTargetVBsFunc.invoke(
-                this.keys, this.ws.dr.read_s, this.ws.dr.read_e, this.target_vbuckets);
+                this.keys, this.ws.dr.read_s,
+                this.ws.dr.read_e - this.ws.dr.read_s, this.target_vbuckets);
             generated_delete_keys = (Map<Long, String>)genKeysForTargetVBsFunc.invoke(
-                this.keys, this.ws.dr.delete_s, this.ws.dr.delete_e, this.target_vbuckets);
+                this.keys, this.ws.dr.delete_s,
+                this.ws.dr.delete_e - this.ws.dr.delete_s, this.target_vbuckets);
             generated_expiry_keys = (Map<Long, String>)genKeysForTargetVBsFunc.invoke(
-                this.keys, this.ws.dr.expiry_s, this.ws.dr.expiry_e, this.target_vbuckets);
-
-            // Because we create '*_e' as 'n' keys,
-            // hence update '*_e' var to track the iteration during next()
-            this.ws.dr.create_e = this.ws.dr.create_s + this.ws.dr.create_e;
-            this.ws.dr.update_e = this.ws.dr.update_s + this.ws.dr.update_e;
-            this.ws.dr.read_e = this.ws.dr.read_s + this.ws.dr.read_e;
-            this.ws.dr.delete_e = this.ws.dr.delete_s + this.ws.dr.delete_e;
-            this.ws.dr.expiry_e = this.ws.dr.expiry_s + this.ws.dr.expiry_e;
+                this.keys, this.ws.dr.expiry_s,
+                this.ws.dr.expiry_e - this.ws.dr.expiry_s, this.target_vbuckets);
         }
     }
 
