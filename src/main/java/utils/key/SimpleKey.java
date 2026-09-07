@@ -48,22 +48,40 @@ public class SimpleKey {
     }
 
     public Map<Long, String> generate_keys_for_target_vbs(Long doc_index, Long num_keys, int[] target_vbs) {
-        int keys_generated = 0;
-        Integer vb_of_key;
-        long key_index = doc_index;
-        String key;
+        // Doc index 'i' is the i'th key of the whole keyspace that lands in
+        // target_vbs, counted from a fixed origin. Scanning from 'doc_index'
+        // instead made the key depend on where the window started, so two
+        // index ranges that do not overlap still returned overlapping keys.
+        // Cost is therefore proportional to the window's end index, not its
+        // width: ~1.4s for 42 of 128 vBuckets at index 5_000_000, but minutes
+        // for a single vBucket of 1024. No caller combines a sparse target
+        // set with a high start index.
         Map<Long, String> generated_keys = new HashMap<Long, String>();
 
-        while(keys_generated < num_keys) {
+        // An empty or reversed range asks for nothing. Checked before
+        // 'last_index' is computed off it, so the scan is not entered just to
+        // return this same empty map (~1s at a doc_index of 5_000_000).
+        if (num_keys <= 0) {
+            return generated_keys;
+        }
+
+        Integer vb_of_key;
+        long last_index = doc_index + num_keys;
+        long matched = 0;
+        long key_index = 0;
+        String key;
+
+        while(matched < last_index) {
             key = this.next(key_index);
             key_index ++;
 
             vb_of_key = this.get_vbucket_for_key(key);
             for (int vb_num : target_vbs) {
                 if (vb_num == vb_of_key) {
-                    generated_keys.put(doc_index, key);
-                    doc_index ++;
-                    keys_generated ++;
+                    if (matched >= doc_index) {
+                        generated_keys.put(matched, key);
+                    }
+                    matched ++;
                     break;
                 }
             }
