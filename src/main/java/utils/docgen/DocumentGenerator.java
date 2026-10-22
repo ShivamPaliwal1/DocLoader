@@ -346,6 +346,15 @@ abstract class KVGenerator{
 
     abstract Tuple2<String, Object> next();
 
+    // Doc index for an in-range ticket of [s, e). Callers must reject tickets >= e
+    // first: mapping never wraps an over-range ticket back into the range.
+    long orderedIndex(long ticket, long s, long e) {
+        KeyOrder order = this.ws.keyOrder;
+        if (order == null)
+            return ticket;
+        return s + order.map(ticket - s, e - s, this.ws.mutated);
+    }
+
     void resetRead() {
         this.ws.dr.readItr =  new AtomicLong(this.ws.dr.read_s);
     }
@@ -408,6 +417,8 @@ public class DocumentGenerator extends KVGenerator{
 
     public Tuple2<String, Object> nextRead() {
         long temp = this.ws.dr.readItr.getAndIncrement();
+        if (temp >= this.ws.dr.read_e) return null; // TOCTOU guard (mirrors nextUpdate)
+        temp = this.orderedIndex(temp, this.ws.dr.read_s, this.ws.dr.read_e);
         String k = null;
         Object v = null;
             try {
@@ -431,6 +442,7 @@ public class DocumentGenerator extends KVGenerator{
         // can retry via has_next_update() which will perform the CircularKey
         // reset under its synchronized block.
         if (temp >= this.ws.dr.update_e) return null;
+        temp = this.orderedIndex(temp, this.ws.dr.update_s, this.ws.dr.update_e);
         String k = null;
         Object v = null;
             try {
@@ -449,6 +461,7 @@ public class DocumentGenerator extends KVGenerator{
     public Tuple2<String, Object> nextExpiry() {
         long temp = this.ws.dr.expiryItr.getAndIncrement();
         if (temp >= this.ws.dr.expiry_e) return null; // TOCTOU guard (mirrors nextUpdate)
+        temp = this.orderedIndex(temp, this.ws.dr.expiry_s, this.ws.dr.expiry_e);
         String k = null;
         Object v = null;
             try {
@@ -513,7 +526,7 @@ public class DocumentGenerator extends KVGenerator{
         while (count < ws.batchSize * ws.creates / 100) {
             long idx = this.ws.dr.createItr.getAndIncrement();
             if (idx >= this.ws.dr.create_e) break;
-            docs.add(nextCreateAt(idx));
+            docs.add(nextCreateAt(this.orderedIndex(idx, this.ws.dr.create_s, this.ws.dr.create_e)));
             count += 1;
         }
         return docs;
@@ -523,7 +536,9 @@ public class DocumentGenerator extends KVGenerator{
         List<Tuple2<String, Object>> docs = new ArrayList<Tuple2<String,Object>>();
         int count = 0;
         while (this.has_next_read() && count<ws.batchSize*ws.reads/100) {
-            docs.add(this.nextRead());
+            Tuple2<String, Object> doc = this.nextRead();
+            if (doc == null) continue; // TOCTOU guard (mirrors nextUpdateBatch)
+            docs.add(doc);
             count += 1;
         }
         return docs;

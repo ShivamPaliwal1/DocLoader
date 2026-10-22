@@ -346,8 +346,9 @@ public class WorkLoadGenerate extends Task{
                     flag = true;
                     List<Tuple2<String, Object>> res = docops.bulkGets(target, docs, getOptions);
                     if (this.dg.ws.validate) {
-                        Map<Object, Object> trnx_res = res.stream().collect(Collectors.toMap(t -> t.get(0), t -> t.get(1)));
-                        Map<Object, Object> trnx_docs = docs.stream().collect(Collectors.toMap(t -> t.get(0), t -> t.get(1)));
+                        // A shuffled/zipfian read batch can name the same key twice
+                        Map<Object, Object> trnx_res = res.stream().collect(Collectors.toMap(t -> t.get(0), t -> t.get(1), (a, b) -> a));
+                        Map<Object, Object> trnx_docs = docs.stream().collect(Collectors.toMap(t -> t.get(0), t -> t.get(1), (a, b) -> a));
                         ObjectMapper om = new ObjectMapper();
                         om.setVisibility(PropertyAccessor.FIELD, Visibility.ANY);
                         for (Object name : trnx_docs.keySet()) {
